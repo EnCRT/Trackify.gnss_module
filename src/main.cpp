@@ -8,9 +8,7 @@
 #include <OneButton.h>
 #include <Adafruit_NeoPixel.h>
 #include <qrcode.h>
-#include <DNSServer.h>
-#include "logs_ui.h"
-
+#include "wifi_manager.h"
 
 // --- Pin Definitions (SAFE for Heltec V3) ---
 #define OLED_RST    21
@@ -31,9 +29,7 @@ TinyGPSPlus gps;
 HardwareSerial ss(1);
 OneButton button(BTN_PIN, true);
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-WebServer server(80);
-DNSServer dnsServer;
-const byte DNS_PORT = 53;
+WiFiManager wifiManager;
 
 // --- State Machine ---
 enum DeviceState { STATE_IDLE, STATE_READY, STATE_LOGGING, STATE_WIFI_AP };
@@ -144,9 +140,7 @@ void stopLogging() {
 }
 
 void stopWiFi() {
-  dnsServer.stop();
-  server.close();
-  WiFi.softAPdisconnect(true);
+  wifiManager.stop();
   currentState = STATE_IDLE;
   Serial.println("WiFi AP Stopped. Restarting GPS.");
   setupGPS(); // Restore GPS serial connection and configuration
@@ -172,187 +166,33 @@ void handleButton() {
   }
 }
 
-String getHumanSize(uint32_t bytes) {
-  if (bytes < 1024) return String(bytes) + " B";
-  if (bytes < 1024 * 1024) return String(bytes / 1024.0, 1) + " KB";
-  return String(bytes / 1024.0 / 1024.0, 1) + " MB";
-}
-
 void startWiFi() {
   if (isLogging) stopLogging();
 
-  // Shut down GPS hardware serial to prevent CPU/interrupt starvation
+  // Shut down GPS hardware serial to prioritize WiFi/SPI...
   Serial.println("Shutting down GPS to prioritize WiFi/SPI...");
   ss.end();
   
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP("LapTimer", "12345678", 1, 0, 4); // Channel 1, hidden false, max 4 clients
-  WiFi.setSleep(false); // Stability: prevent radio sleep in AP mode
-
-  IPAddress local_IP(192, 168, 0, 11);
-  IPAddress gateway(192, 168, 0, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.softAPConfig(local_IP, gateway, subnet);
-
-  // Captive Portal DNS
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(DNS_PORT, "*", local_IP);
-
-  server.on("/download", HTTP_GET, [](){
-    if(server.hasArg("file")){
-      String fileName = server.arg("file");
-      if (!fileName.startsWith("/")) fileName = "/" + fileName;
-      
-      Serial.print("Download request for: "); Serial.println(fileName);
-      
-      if (sdDetected && SD.exists(fileName)) {
-        Serial.println("File found, sending...");
-        File file = SD.open(fileName, FILE_READ);
-        if (file) {
-          // Disable Nagle algorithm to prevent buffering delays on large chunk streams
-          server.client().setNoDelay(true);
-          
-          server.sendHeader("Content-Disposition", "attachment; filename=\"" + fileName.substring(1) + "\"");
-          server.sendHeader("Connection", "close");
-          server.setContentLength(file.size());
-          server.send(200, "application/octet-stream", ""); // send Headers
-
-          WiFiClient client = server.client();
-          
-          // Custom highly optimized SD to WiFi streamer.
-          // Size must be exactly a multiple of SD block size (512 bytes)
-          const size_t bufferSize = 8192; 
-          uint8_t *buffer = (uint8_t *)malloc(bufferSize);
-          
-          if (buffer) {
-            size_t bytesRead;
-            while (file.available()) {
-              bytesRead = file.read(buffer, bufferSize);
-              if (bytesRead > 0) {
-                // Ensure all bytes are written to the socket
-                size_t bytesWritten = 0;
-                while (bytesWritten < bytesRead) {
-                    size_t w = client.write(buffer + bytesWritten, bytesRead - bytesWritten);
-                    if (w == 0) {
-                       delay(1); // Small delay to let TCP stack process ACKs if send buffer is full
-                    } else {
-                       bytesWritten += w;
-                    }
-                }
-              }
-              // Pet the watchdog during long file transfers
-              vTaskDelay(1 / portTICK_PERIOD_MS); 
-            }
-            free(buffer);
-            Serial.println("File sent successfully.");
-          } else {
-            Serial.println("Memory allocation failed for buffer!");
-            server.send(500, "text/plain", "Not enough memory");
-          }
-
-          file.close();
-        } else {
-          server.send(500, "text/plain", "Error opening file");
-        }
-      } else {
-        Serial.println("File NOT found on SD or SD not detected!");
-        server.send(404, "text/plain", "File not found");
-      }
-    } else {
-      server.send(400, "text/plain", "File param missing");
-    }
-  });
-
-  server.on("/", HTTP_GET, [](){
-    Serial.println("Web request: index");
-    
-    if (!sdDetected) {
-      server.send(200, "text/html", "SD Card Error!");
-      return;
-    }
-
-    String html = FPSTR(LOGS_HTML);
-
-    // Optimizing string concatenation
-    String fileList = "";
-    fileList.reserve(2048); // Pre-allocate memory for speed
-
-    File root = SD.open("/");
-    if (root) {
-      File file = root.openNextFile();
-      int count = 1;
-      while(file){
-        String name = String(file.name());
-        if (!file.isDirectory() && name.endsWith(".txt")) {
-          String displayName = name;
-          if (displayName.startsWith("/")) displayName.remove(0, 1);
-          
-          fileList += "<tr><td>" + String(count++) + "</td>";
-          fileList += "<td><span class='file-name'>" + displayName + "</span></td>";
-          fileList += "<td><span class='file-size'>" + getHumanSize(file.size()) + "</span></td>";
-          fileList += "<td><div class='action-buttons'><button onclick='downloadTxt(this, \"" + displayName + "\")' class='btn'>TXT</button>";
-          fileList += "<button onclick='downloadGPX(this, \"" + displayName + "\")' class='btn'>GPX</button>";
-          fileList += "<button onclick='deleteFile(\"" + displayName + "\")' class='btn btn-danger'>Delete</button></div></td></tr>";
-        }
-        file.close();
-        file = root.openNextFile();
-      }
-      root.close();
-    }
-    
-    html.replace("%FILE_LIST%", fileList);
-    server.send(200, "text/html", html);
-    Serial.println("Response sent");
-  });
-
-  server.on("/delete", HTTP_POST, [](){
-    if(server.hasArg("file")){
-      String fileName = server.arg("file");
-      if (!fileName.startsWith("/")) fileName = "/" + fileName;
-      
-      Serial.print("Delete request for: "); Serial.println(fileName);
-      
-      if (sdDetected && SD.exists(fileName)) {
-        if (SD.remove(fileName)) {
-          Serial.println("File deleted successfully.");
-          server.send(200, "text/plain", "OK");
-        } else {
-          Serial.println("Failed to delete file.");
-          server.send(500, "text/plain", "Delete Failed");
-        }
-      } else {
-        server.send(404, "text/plain", "File not found");
-      }
-    } else {
-      server.send(400, "text/plain", "File param missing");
-    }
-  });
-
-  server.onNotFound([](){
-    String url = server.uri();
-    Serial.print("Not Found: "); Serial.println(url);
-    
-    // Some devices probe for these, just ignore
-    if (url.endsWith(".ico") || url.endsWith(".map")) {
-      server.send(404, "text/plain", "Not Found");
-      return;
-    }
-    
-    server.sendHeader("Location", "http://192.168.0.11/", true);
-    server.send(302, "text/plain", "Redirecting...");
-  });
-
-  server.begin();
+  wifiManager.begin();
   currentState = STATE_WIFI_AP;
-  Serial.println("Web Server Started.");
 
   // Draw WiFi status once and stop OLED updates
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 10, "WiFi:");
-  u8g2.drawStr(0, 30, "LapTimer");
+  u8g2.drawStr(0, 30, "Trackify");
   u8g2.drawStr(0, 40, "12345678");
-  drawQRCode("WIFI:S:LapTimer;T:WPA;P:12345678;;", 65, 5);
+  drawQRCode("WIFI:S:Trackify;T:WPA;P:12345678;;", 65, 5);
+  u8g2.sendBuffer();
+}
+
+  // Draw WiFi status once and stop OLED updates
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, "WiFi:");
+  u8g2.drawStr(0, 30, "Trackify");
+  u8g2.drawStr(0, 40, "12345678");
+  drawQRCode("WIFI:S:Trackify;T:WPA;P:12345678;;", 65, 5);
   u8g2.sendBuffer();
 }
 
@@ -420,10 +260,9 @@ void loop() {
   
   // WiFi mode optimization: suspend all other tasks
   if (currentState == STATE_WIFI_AP) {
-    dnsServer.processNextRequest();
-    server.handleClient();
+    wifiManager.handle();
     updateLED();
-    vTaskDelay(2 / portTICK_PERIOD_MS); // Yield 2ms to WiFi stack (reduced from 10 to increase output speed)
+    vTaskDelay(2 / portTICK_PERIOD_MS); 
     return;
   }
 
@@ -448,7 +287,7 @@ void loop() {
   
   // 1. TOP BAR: Branding + Icons
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 10, "MotoLapTimer");
+  u8g2.drawStr(0, 10, "Trackify");
   u8g2.drawXBM(90, 1, 10, 10, icon_gps_bits);
   u8g2.setCursor(102, 10); u8g2.print(gpsCommunicating ? "+" : "-");
   u8g2.drawXBM(110, 1, 10, 10, icon_sd_bits);
