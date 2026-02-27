@@ -246,7 +246,7 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
                 <div class="header-top">
                     <div class="brand">
                         <span class="logo-emoji" id="logo-emoji">🏁</span>
-                        <h1>Trackify</h1>
+                        <h1>Trackify <span style="font-size: 0.9rem; font-weight: 500; vertical-align: middle; opacity: 0.7; margin-left: 4px;">%GPS_FREQ%Hz</span></h1>
                     </div>
                     <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">
                         <span id="theme-icon">🌙</span>

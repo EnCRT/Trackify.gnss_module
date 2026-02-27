@@ -6,10 +6,11 @@ static const IPAddress local_IP(192, 168, 0, 11);
 static const IPAddress gateway(192, 168, 0, 1);
 static const IPAddress subnet(255, 255, 255, 0);
 
-WiFiManager::WiFiManager() : _server(80), _running(false) {}
+WiFiManager::WiFiManager() : _server(80), _running(false), _gpsFreq(0) {}
 
-void WiFiManager::begin() {
+void WiFiManager::begin(uint8_t gpsFreqHz) {
     if (_running) return;
+    _gpsFreq = gpsFreqHz;
 
     Serial.println("Starting WiFi AP: Trackify...");
     WiFi.mode(WIFI_AP);
@@ -47,6 +48,7 @@ void WiFiManager::_setupRoutes() {
         Serial.println("Web request: index");
         String html = FPSTR(LOGS_HTML);
         html.replace("%FILE_LIST%", _generateFileList());
+        html.replace("%GPS_FREQ%", String(_gpsFreq));
         request->send(200, "text/html", html);
     });
 
@@ -57,8 +59,21 @@ void WiFiManager::_setupRoutes() {
 
             Serial.print("Download request for: "); Serial.println(fileName);
 
-            if (SD.exists(fileName)) {
-                request->send(SD, fileName, "application/octet-stream");
+            if (sd.exists(fileName.c_str())) {
+                auto file = std::make_shared<FsFile>();
+                if (file->open(fileName.c_str(), O_RDONLY)) {
+                    AsyncWebServerResponse *response = request->beginResponse("application/octet-stream", file->fileSize(), [file](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+                        int read = file->read(buffer, maxLen);
+                        if (read <= 0) {
+                            return 0;
+                        }
+                        return (size_t)read;
+                    });
+                    response->addHeader("Content-Disposition", "attachment; filename=\"" + fileName.substring(fileName.lastIndexOf("/") + 1) + "\"");
+                    request->send(response);
+                } else {
+                    request->send(500, "text/plain", "Failed to open file");
+                }
             } else {
                 request->send(404, "text/plain", "File not found");
             }
@@ -74,8 +89,8 @@ void WiFiManager::_setupRoutes() {
 
             Serial.print("Delete request for: "); Serial.println(fileName);
 
-            if (SD.exists(fileName)) {
-                if (SD.remove(fileName)) {
+            if (sd.exists(fileName.c_str())) {
+                if (sd.remove(fileName.c_str())) {
                     request->send(200, "text/plain", "OK");
                 } else {
                     request->send(500, "text/plain", "Delete Failed");
@@ -104,15 +119,18 @@ String WiFiManager::_generateFileList() {
     String fileList = "";
     fileList.reserve(2048);
 
-    File root = SD.open("/");
-    if (!root) return "SD Error";
+    FsFile root = sd.open("/");
+    if (!root || !root.isDirectory()) return "SD Error";
 
-    File file = root.openNextFile();
+    FsFile file;
     int count = 1;
-    while (file) {
-        String name = String(file.name());
-        if (!file.isDirectory() && name.endsWith(".txt")) {
-            String displayName = name;
+    while (file.openNext(&root)) {
+        char name[128];
+        file.getName(name, sizeof(name));
+        String fileName = String(name);
+        
+        if (!file.isDirectory() && fileName.endsWith(".txt")) {
+            String displayName = fileName;
             if (displayName.startsWith("/")) displayName.remove(0, 1);
 
             fileList += "<tr><td>" + String(count++) + "</td>";
@@ -123,7 +141,6 @@ String WiFiManager::_generateFileList() {
             fileList += "<button onclick='deleteFile(\"" + displayName + "\")' class='btn btn-danger'>Delete</button></div></td></tr>";
         }
         file.close();
-        file = root.openNextFile();
     }
     root.close();
     return fileList;
