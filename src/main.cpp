@@ -19,6 +19,7 @@
 #include "SdFat.h"
 #include "sdios.h"
 #include "wifi_manager.h"
+#include "ble_manager.h"
 
 // --- Pin Definitions (SAFE for Heltec V3) ---
 #define OLED_RST    21
@@ -62,7 +63,7 @@ WiFiManager wifiManager;
 SdFs sd;
 
 // --- State Machine ---
-enum DeviceState { STATE_IDLE, STATE_READY, STATE_PREALLOCATING, STATE_LOGGING, STATE_WIFI_AP };
+enum DeviceState { STATE_IDLE, STATE_READY, STATE_PREALLOCATING, STATE_LOGGING, STATE_WIFI_AP, STATE_BLE_SERVER };
 volatile DeviceState currentState = STATE_IDLE;
 
 volatile bool isLogging = false;
@@ -84,7 +85,7 @@ volatile SharedGpsData sharedGpsData = {0, 0.0, false, false, false};
 SemaphoreHandle_t gpsMutex = NULL;
 
 // --- Inter-core Command Queue ---
-enum Command { CMD_START_LOGGING, CMD_STOP_LOGGING, CMD_START_WIFI, CMD_STOP_WIFI };
+enum Command { CMD_START_LOGGING, CMD_STOP_LOGGING, CMD_START_WIFI, CMD_STOP_WIFI, CMD_START_BLE, CMD_STOP_BLE };
 QueueHandle_t commandQueue = NULL;
 
 // --- SD Write Buffer ---
@@ -241,11 +242,24 @@ void gpsTask(void *param) {
           Serial.println("[GPS] WiFi stopped. Restarting GPS.");
           setupGPS();
           break;
+        case CMD_START_BLE:
+          if (isLogging) stopLogging();
+          Serial.println("[GPS] Shutting down GPS for BLE mode...");
+          ss.end();
+          bleManager.begin();
+          currentState = STATE_BLE_SERVER;
+          break;
+        case CMD_STOP_BLE:
+          bleManager.stop();
+          currentState = STATE_IDLE;
+          Serial.println("[GPS] BLE stopped. Restarting GPS.");
+          setupGPS();
+          break;
       }
     }
 
     // --- 2. Read GPS UART and write to SD ---
-    if (currentState != STATE_WIFI_AP) {
+    if (currentState != STATE_WIFI_AP && currentState != STATE_BLE_SERVER) {
       // Periodic SD check if not detected
       static uint32_t lastSdCheck = 0;
       if (!sdDetected && (millis() - lastSdCheck) > 10000) {
@@ -357,6 +371,10 @@ void updateLED() {
         baseColor = strip.Color(0, 0, 255); // Blue
         shouldFlash = true;
         break;
+      case STATE_BLE_SERVER:
+        baseColor = strip.Color(128, 0, 128); // Purple for BLE
+        shouldFlash = true;
+        break;
       case STATE_PREALLOCATING: 
         baseColor = strip.Color(255, 0, 0); // Red
         shouldFlash = true;
@@ -398,6 +416,11 @@ void handleButton() {
     xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
     return;
   }
+  if (currentState == STATE_BLE_SERVER) {
+    Command cmd = CMD_STOP_BLE;
+    xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
+    return;
+  }
 
   if (isLogging || currentState == STATE_PREALLOCATING) {
     Command cmd = CMD_STOP_LOGGING;
@@ -420,8 +443,8 @@ void handleButton() {
 }
 
 void handleLongPress() {
-  Serial.println("[UI] Long press — starting WiFi AP.");
-  Command cmd = CMD_START_WIFI;
+  Serial.println("[UI] Long press — starting BLE Server.");
+  Command cmd = CMD_START_BLE;
   xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
 }
 
@@ -431,6 +454,9 @@ void updateOLED() {
   if (currentState == STATE_WIFI_AP) {
     // WiFi screen is drawn once when entering WiFi mode, skip updates
     return;
+  }
+  if (currentState == STATE_BLE_SERVER) {
+    return; // Will be handled in uiTask
   }
 
   // Read shared GPS data under mutex
@@ -524,6 +550,18 @@ void uiTask(void *param) {
         wifiScreenDrawn = true;
       }
       wifiManager.handle();
+      vTaskDelay(pdMS_TO_TICKS(10));
+    } else if (currentState == STATE_BLE_SERVER) {
+      if (!wifiScreenDrawn) {
+        u8g2.clearBuffer();
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(20, 20, "BLE Server");
+        u8g2.drawStr(10, 40, "Name: Trackify");
+        u8g2.drawStr(10, 55, "Waiting for App...");
+        u8g2.sendBuffer();
+        wifiScreenDrawn = true;
+      }
+      bleManager.handle();
       vTaskDelay(pdMS_TO_TICKS(10));
     } else {
       wifiScreenDrawn = false;
