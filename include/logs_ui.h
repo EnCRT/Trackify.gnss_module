@@ -7,7 +7,7 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MotoLapTimer | Logs</title>
+    <title>Trackify | Logs</title>
     <style>
         :root {
             --bg: #0f172a;
@@ -246,7 +246,7 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
                 <div class="header-top">
                     <div class="brand">
                         <span class="logo-emoji" id="logo-emoji">🏁</span>
-                        <h1>MotoLapTimer</h1>
+                        <h1>Trackify <span style="font-size: 0.9rem; font-weight: 500; vertical-align: middle; opacity: 0.7; margin-left: 4px;">%GPS_FREQ%Hz</span></h1>
                     </div>
                     <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">
                         <span id="theme-icon">🌙</span>
@@ -370,7 +370,7 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
             // Let's ensure we split correctly.
             const rawSentences = nmeaText.split('$');
             let gpx = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-            gpx += `<gpx version="1.1" creator="MotoLapTimer" xmlns="http://www.topografix.com/GPX/1/1">\n`;
+            gpx += `<gpx version="1.1" creator="Trackify" xmlns="http://www.topografix.com/GPX/1/1">\n`;
             gpx += `  <trk>\n    <name>${fileName}</name>\n    <trkseg>\n`;
 
             let currentPoint = null;
