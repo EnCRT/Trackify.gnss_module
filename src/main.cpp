@@ -63,7 +63,7 @@ WiFiManager wifiManager;
 SdFs sd;
 
 // --- State Machine ---
-enum DeviceState { STATE_IDLE, STATE_READY, STATE_PREALLOCATING, STATE_LOGGING, STATE_WIFI_AP, STATE_BLE_SERVER };
+enum DeviceState { STATE_IDLE, STATE_READY, STATE_PREALLOCATING, STATE_LOGGING, STATE_WIRELESS_SYNC };
 volatile DeviceState currentState = STATE_IDLE;
 
 volatile bool isLogging = false;
@@ -85,7 +85,7 @@ volatile SharedGpsData sharedGpsData = {0, 0.0, false, false, false};
 SemaphoreHandle_t gpsMutex = NULL;
 
 // --- Inter-core Command Queue ---
-enum Command { CMD_START_LOGGING, CMD_STOP_LOGGING, CMD_START_WIFI, CMD_STOP_WIFI, CMD_START_BLE, CMD_STOP_BLE };
+enum Command { CMD_START_LOGGING, CMD_STOP_LOGGING, CMD_START_WIRELESS, CMD_STOP_WIRELESS };
 QueueHandle_t commandQueue = NULL;
 
 // --- SD Write Buffer ---
@@ -228,38 +228,26 @@ void gpsTask(void *param) {
         case CMD_STOP_LOGGING:
           stopLogging();
           break;
-        case CMD_START_WIFI:
-          // Stop logging if active, then shut down GPS UART
+        case CMD_START_WIRELESS:
           if (isLogging) stopLogging();
-          Serial.println("[GPS] Shutting down GPS for WiFi mode...");
+          Serial.println("[GPS] Shutting down GPS for Wireless mode...");
           ss.end();
           wifiManager.begin(GPS_FREQ_HZ);
-          currentState = STATE_WIFI_AP;
+          bleManager.begin();
+          currentState = STATE_WIRELESS_SYNC;
           break;
-        case CMD_STOP_WIFI:
+        case CMD_STOP_WIRELESS:
+          bleManager.stop();
           wifiManager.stop();
           currentState = STATE_IDLE;
-          Serial.println("[GPS] WiFi stopped. Restarting GPS.");
-          setupGPS();
-          break;
-        case CMD_START_BLE:
-          if (isLogging) stopLogging();
-          Serial.println("[GPS] Shutting down GPS for BLE mode...");
-          ss.end();
-          bleManager.begin();
-          currentState = STATE_BLE_SERVER;
-          break;
-        case CMD_STOP_BLE:
-          bleManager.stop();
-          currentState = STATE_IDLE;
-          Serial.println("[GPS] BLE stopped. Restarting GPS.");
+          Serial.println("[GPS] Wireless stopped. Restarting GPS.");
           setupGPS();
           break;
       }
     }
 
     // --- 2. Read GPS UART and write to SD ---
-    if (currentState != STATE_WIFI_AP && currentState != STATE_BLE_SERVER) {
+    if (currentState != STATE_WIRELESS_SYNC) {
       // Periodic SD check if not detected
       static uint32_t lastSdCheck = 0;
       if (!sdDetected && (millis() - lastSdCheck) > 10000) {
@@ -367,12 +355,8 @@ void updateLED() {
         baseColor = strip.Color(255, 255, 255); // White
         shouldFlash = true;
         break;
-      case STATE_WIFI_AP:       
-        baseColor = strip.Color(0, 0, 255); // Blue
-        shouldFlash = true;
-        break;
-      case STATE_BLE_SERVER:
-        baseColor = strip.Color(128, 0, 128); // Purple for BLE
+      case STATE_WIRELESS_SYNC:
+        baseColor = strip.Color(0, 255, 255); // Cyan for Hybrid Sync
         shouldFlash = true;
         break;
       case STATE_PREALLOCATING: 
@@ -411,13 +395,8 @@ void ledTask(void *param) {
 // --- Button Handlers (run on UI Task / Core 0, send commands to GPS Task) ---
 void handleButton() {
   Serial.println("[UI] Button Clicked!");
-  if (currentState == STATE_WIFI_AP) {
-    Command cmd = CMD_STOP_WIFI;
-    xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
-    return;
-  }
-  if (currentState == STATE_BLE_SERVER) {
-    Command cmd = CMD_STOP_BLE;
+  if (currentState == STATE_WIRELESS_SYNC) {
+    Command cmd = CMD_STOP_WIRELESS;
     xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
     return;
   }
@@ -443,20 +422,15 @@ void handleButton() {
 }
 
 void handleLongPress() {
-  Serial.println("[UI] Long press — starting BLE Server.");
-  Command cmd = CMD_START_BLE;
+  Serial.println("[UI] Long press — starting Wireless Sync.");
+  Command cmd = CMD_START_WIRELESS;
   xQueueSend(commandQueue, &cmd, pdMS_TO_TICKS(100));
 }
 
 // --- OLED Update (called from UI Task) ---
 void updateOLED() {
-  // In WiFi mode, draw WiFi screen once (static)
-  if (currentState == STATE_WIFI_AP) {
-    // WiFi screen is drawn once when entering WiFi mode, skip updates
-    return;
-  }
-  if (currentState == STATE_BLE_SERVER) {
-    return; // Will be handled in uiTask
+  if (currentState == STATE_WIRELESS_SYNC) {
+    return; // Handled in uiTask
   }
 
   // Read shared GPS data under mutex
@@ -537,30 +511,19 @@ void uiTask(void *param) {
   for (;;) {
     button.tick();
 
-    if (currentState == STATE_WIFI_AP) {
-      // Draw WiFi screen only once
+    if (currentState == STATE_WIRELESS_SYNC) {
       if (!wifiScreenDrawn) {
         u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_6x10_tf);
-        u8g2.drawStr(0, 10, "WiFi:");
-        u8g2.drawStr(0, 30, "Trackify");
-        u8g2.drawStr(0, 40, "12345678");
-        drawQRCode("WIFI:S:Trackify;T:WPA;P:12345678;;", 65, 5);
+        u8g2.setFont(u8g2_font_ncenB08_tr);
+        u8g2.drawStr(5, 15, "Wireless Sync");
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.drawStr(0, 30, "WiFi: Trackify / 12345678");
+        u8g2.drawStr(0, 45, "BLE: Trackify");
+        u8g2.drawStr(0, 60, "Waiting for App...");
         u8g2.sendBuffer();
         wifiScreenDrawn = true;
       }
       wifiManager.handle();
-      vTaskDelay(pdMS_TO_TICKS(10));
-    } else if (currentState == STATE_BLE_SERVER) {
-      if (!wifiScreenDrawn) {
-        u8g2.clearBuffer();
-        u8g2.setFont(u8g2_font_ncenB08_tr);
-        u8g2.drawStr(20, 20, "BLE Server");
-        u8g2.drawStr(10, 40, "Name: Trackify");
-        u8g2.drawStr(10, 55, "Waiting for App...");
-        u8g2.sendBuffer();
-        wifiScreenDrawn = true;
-      }
       bleManager.handle();
       vTaskDelay(pdMS_TO_TICKS(10));
     } else {

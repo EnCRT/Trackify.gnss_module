@@ -39,10 +39,8 @@ class CommandCallbacks: public NimBLECharacteristicCallbacks {
             
             if (cmd == "LIST") {
                 bleManager.triggerListFiles();
-            } else if (cmd.startsWith("GET ")) {
-                String filename = cmd.substring(4);
-                filename.trim();
-                bleManager.triggerFileDownload(filename);
+            } else if (cmd == "WIFI") {
+                bleManager.sendWifiInfo();
             }
         }
     }
@@ -109,13 +107,11 @@ void BLEManager::triggerListFiles() {
     _transferState = LISTING;
 }
 
-void BLEManager::triggerFileDownload(String filename) {
-    if (_transferState != IDLE) return;
-    _fileToDownload = filename;
-    if (!_fileToDownload.startsWith("/")) {
-        _fileToDownload = "/" + _fileToDownload;
-    }
-    _transferState = SENDING_FILE;
+void BLEManager::sendWifiInfo() {
+    String wifiData = "WIFI:Trackify:12345678\n";
+    pDataCharacteristic->setValue((uint8_t*)wifiData.c_str(), wifiData.length());
+    pDataCharacteristic->notify();
+    Serial.println("[BLE] Sent WiFi credentials.");
 }
 
 void BLEManager::handle() {
@@ -158,50 +154,6 @@ void BLEManager::handle() {
             pDataCharacteristic->setValue((uint8_t*)errMsg.c_str(), errMsg.length());
             pDataCharacteristic->notify();
         }
-        _transferState = IDLE;
-    }
-    else if (_transferState == SENDING_FILE) {
-        Serial.print("[BLE] Sending file: ");
-        Serial.println(_fileToDownload);
-        
-        FsFile file;
-        if (file.open(_fileToDownload.c_str(), O_RDONLY)) {
-            // Get negotiated MTU size
-            uint16_t mtu = NimBLEDevice::getMTU();
-            size_t chunkSize = mtu > 3 ? mtu - 3 : 20; // MTU - 3 is max payload for notification
-            if (chunkSize > 500) chunkSize = 500; // Cap it
-            
-            uint8_t* buffer = new uint8_t[chunkSize];
-            int bytesRead;
-            
-            while ((bytesRead = file.read(buffer, chunkSize)) > 0) {
-                pDataCharacteristic->setValue(buffer, bytesRead);
-                pDataCharacteristic->notify();
-                
-                // Allow background tasks to run and avoid watchdog
-                vTaskDelay(1); 
-                
-                // If client disconnects, abort
-                if (!isConnected()) {
-                    Serial.println("[BLE] Client disconnected during transfer. Aborting.");
-                    break;
-                }
-            }
-            
-            delete[] buffer;
-            file.close();
-            
-            // Send EOF marker (0 byte payload)
-            pDataCharacteristic->setValue((uint8_t*)nullptr, 0);
-            pDataCharacteristic->notify();
-            Serial.println("[BLE] File transfer complete.");
-        } else {
-            Serial.println("[BLE] Failed to open file for reading.");
-            String errMsg = "ERROR: File not found";
-            pDataCharacteristic->setValue((uint8_t*)errMsg.c_str(), errMsg.length());
-            pDataCharacteristic->notify();
-        }
-        
         _transferState = IDLE;
     }
 }

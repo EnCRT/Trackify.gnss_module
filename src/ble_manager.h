@@ -13,15 +13,14 @@ public:
     
     // Internal state handling triggered by callbacks
     void triggerListFiles();
-    void triggerFileDownload(String filename);
+    void sendWifiInfo();
 
 private:
     bool _isRunning = false;
     bool _deviceConnected = false;
     
-    enum TransferState { IDLE, LISTING, SENDING_FILE };
+    enum TransferState { IDLE, LISTING };
     TransferState _transferState = IDLE;
-    String _fileToDownload;
 };
 
 extern BLEManager bleManager;
