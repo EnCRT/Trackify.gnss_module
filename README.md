@@ -187,7 +187,8 @@ pio device monitor -b 115200    # serial monitor
 
 ## 📱 Integration with moto_lap_timer
 
-> 📖 Full workflow: [bluetooth_integration_docs.md](bluetooth_integration_docs.md)  
+> 🗺️ **Full Architecture & Integration Map:** [SYSTEM_GUIDELINE.md](SYSTEM_GUIDELINE.md)  
+> 📖 BLE protocol workflow: [bluetooth_integration_docs.md](bluetooth_integration_docs.md)  
 > 📖 Binary specification: [trackify_bin_format_spec.md](trackify_bin_format_spec.md)
 
 ```
