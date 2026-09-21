@@ -129,14 +129,14 @@ String WiFiManager::_generateFileList() {
         file.getName(name, sizeof(name));
         String fileName = String(name);
         
-        if (!file.isDirectory() && fileName.endsWith(".txt")) {
+        if (!file.isDirectory() && (fileName.endsWith(".txt") || fileName.endsWith(".bin"))) {
             String displayName = fileName;
             if (displayName.startsWith("/")) displayName.remove(0, 1);
 
             fileList += "<tr><td>" + String(count++) + "</td>";
             fileList += "<td><span class='file-name'>" + displayName + "</span></td>";
             fileList += "<td><span class='file-size'>" + _getHumanSize(file.size()) + "</span></td>";
-            fileList += "<td><div class='action-buttons'><button onclick='downloadTxt(this, \"" + displayName + "\")' class='btn'>TXT</button>";
+            fileList += "<td><div class='action-buttons'><button onclick='downloadTxt(this, \"" + displayName + "\")' class='btn'>RAW</button>";
             fileList += "<button onclick='downloadGPX(this, \"" + displayName + "\")' class='btn'>GPX</button>";
             fileList += "<button onclick='deleteFile(\"" + displayName + "\")' class='btn btn-danger'>Delete</button></div></td></tr>";
         }

@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
-#include <TinyGPS++.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -20,6 +19,9 @@
 #include "sdios.h"
 #include "wifi_manager.h"
 #include "ble_manager.h"
+#include "ubx_parser.h"
+#include <SparkFun_u-blox_GNSS_v3.h>
+#include "esp_mac.h"
 
 // --- Pin Definitions (SAFE for Heltec V3) ---
 #define OLED_RST    21
@@ -38,11 +40,17 @@
 #define GPS_FREQ_HZ 25 // Change to 10 for 10Hz operation
 
 // --- UART Buffer Size (protection against overflow at 25Hz) ---
-#define GPS_UART_BUFFER_SIZE 2048
+#define GPS_UART_BUFFER_SIZE 8192
+
+// --- SD Preallocation Size (50MB is ~15 hours of 25Hz binary logging, reduces allocation delay) ---
+#define SD_PREALLOC_SIZE (50ULL * 1024 * 1024)
 
 // --- SD Write Buffer (sector-aligned for optimal performance) ---
 #define SD_WRITE_BUFFER_SIZE 512
 #define SD_FLUSH_INTERVAL_MS 200
+
+// --- LogMeta periodic flush (keeps record_count on SD fresh for crash recovery) ---
+#define META_FLUSH_INTERVAL_MS 5000
 
 // --- FreeRTOS Task Configuration ---
 #define GPS_TASK_STACK_SIZE  8192
@@ -55,12 +63,51 @@
 
 // --- Objects ---
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, OLED_RST, 18, 17);
-TinyGPSPlus gps;
 HardwareSerial ss(1);
 OneButton button(BTN_PIN, true);
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 WiFiManager wifiManager;
 SdFs sd;
+UbxParser _ubxParser;
+static bool _logHeaderNeeded = false;
+static uint16_t actualGpsFreqHz = 0;
+
+// --- Log Metadata (prepared at startup, written to each .bin file) ---
+static LogMeta g_logMeta;
+static void prepareLogMeta() {
+  memset(&g_logMeta, 0, sizeof(g_logMeta));
+
+  // Device name
+  strncpy(g_logMeta.name, "Trackify MX", sizeof(g_logMeta.name) - 1);
+
+  // Serial number: last 3 bytes of MAC as hex string
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(g_logMeta.serial_number, sizeof(g_logMeta.serial_number),
+           "%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+  // Model
+  strncpy(g_logMeta.model, "Trackify GNSS", sizeof(g_logMeta.model) - 1);
+
+  // Hardware / firmware
+  g_logMeta.hardware_revision = 0;        // prototype
+  g_logMeta.firmware_version  = 0x0200;   // v2.0
+
+  // MAC address (raw bytes)
+  memcpy(g_logMeta.mac_address, mac, 6);
+
+  // Sample rate — will be updated after GPS init
+  // actualGpsFreqHz is 0 until setupGPS() completes
+
+  Serial.println("[META] Log metadata prepared:");
+  Serial.printf("  name: %s\n", g_logMeta.name);
+  Serial.printf("  serial: %s\n", g_logMeta.serial_number);
+  Serial.printf("  model: %s\n", g_logMeta.model);
+  Serial.printf("  fw: %04X  hw: %d\n",
+                g_logMeta.firmware_version, g_logMeta.hardware_revision);
+  Serial.printf("  MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
 
 // --- State Machine ---
 enum DeviceState { STATE_IDLE, STATE_READY, STATE_PREALLOCATING, STATE_LOGGING, STATE_WIRELESS_SYNC };
@@ -71,6 +118,12 @@ bool sdDetected = false;
 unsigned long loggingStartTime = 0;
 FsFile logFile;
 char currentFileName[32];
+
+// --- Meta flush + crash recovery state ---
+static uint32_t g_recordCount = 0;        // TrackRecords written to current file
+static uint32_t g_metaOffset = 0;         // byte offset of LogMeta from file start (= header length)
+static uint32_t g_lastFlushedCount = 0;   // last record_count persisted to SD
+static unsigned long g_lastMetaFlushMs = 0;
 
 // --- Shared GPS Data (protected by mutex) ---
 struct SharedGpsData {
@@ -101,12 +154,11 @@ TaskHandle_t gpsTaskHandle = NULL;
 TaskHandle_t uiTaskHandle = NULL;
 
 // --- GPS UBX Commands ---
-// 10Hz (100ms)
+// Rate commands kept for fallback; primary config uses SparkFun v3 VALSET
 const uint8_t UBX_CFG_RATE_10HZ[] = {
   0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0x64, 0x00, 0x01, 0x00, 0x01, 0x00, 0x7A, 0x12
 };
 
-// 25Hz (40ms)
 const uint8_t UBX_CFG_RATE_25HZ[] = {
   0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0x28, 0x00, 0x01, 0x00, 0x01, 0x00, 0x3E, 0xAA
 };
@@ -125,11 +177,39 @@ void setupGPS() {
   ss.setRxBufferSize(GPS_UART_BUFFER_SIZE);
   delay(100);
 
-  #if GPS_FREQ_HZ == 25
-    sendUBX(UBX_CFG_RATE_25HZ, sizeof(UBX_CFG_RATE_25HZ));
-  #else
-    sendUBX(UBX_CFG_RATE_10HZ, sizeof(UBX_CFG_RATE_10HZ));
-  #endif
+  SFE_UBLOX_GNSS_SERIAL gnss;
+  if (!gnss.begin(ss)) {
+    Serial.println("[GPS] SparkFun init FAILED — falling back to UBX CFG-RATE");
+    #if GPS_FREQ_HZ == 25
+      sendUBX(UBX_CFG_RATE_25HZ, sizeof(UBX_CFG_RATE_25HZ));
+    #else
+      sendUBX(UBX_CFG_RATE_10HZ, sizeof(UBX_CFG_RATE_10HZ));
+    #endif
+    actualGpsFreqHz = GPS_FREQ_HZ;
+    return;
+  }
+
+  uint16_t measRate = (uint16_t)(1000 / GPS_FREQ_HZ);
+  gnss.setMeasurementRate(measRate, VAL_LAYER_RAM_BBR);
+  gnss.setUART1Output(COM_TYPE_UBX);
+
+  delay(200);
+
+  uint16_t actualMeasRate = 0;
+  if (gnss.getMeasurementRate(&actualMeasRate, VAL_LAYER_RAM)) {
+    if (actualMeasRate > 0) {
+      actualGpsFreqHz = 1000 / actualMeasRate;
+    } else {
+      actualGpsFreqHz = GPS_FREQ_HZ;
+    }
+    Serial.printf("[GPS] MeasRate=%ums → %dHz (requested %dHz)\n", actualMeasRate, actualGpsFreqHz, GPS_FREQ_HZ);
+  } else {
+    actualGpsFreqHz = GPS_FREQ_HZ;
+    Serial.println("[GPS] VALGET failed — using requested frequency");
+  }
+
+  gnss.end();
+  _ubxParser.reset();
 }
 
 void setupSD() {
@@ -151,35 +231,110 @@ void flushSdBuffer() {
   }
 }
 
+// --- Write raw bytes to SD buffer with auto-flush ---
+static inline void sdWriteBytes(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    sdWriteBuffer[sdBufPos++] = data[i];
+    if (sdBufPos >= SD_WRITE_BUFFER_SIZE) {
+      logFile.write(sdWriteBuffer, SD_WRITE_BUFFER_SIZE);
+      sdBufPos = 0;
+      lastFlushTime = millis();
+    }
+  }
+}
+
+// --- Write .bin file header ---
+static void writeLogHeader(const NavPvtPayload& pvt) {
+  char header[128];
+  snprintf(header, sizeof(header),
+    "#TRACKIFY:VER=2;FREQ=%d;UTC=%04d-%02d-%02dT%02d:%02d:%02d.%09dZ;PROTO=UBX-NAV-PVT\n",
+    actualGpsFreqHz,
+    pvt.year, pvt.month, pvt.day,
+    pvt.hour, pvt.min, pvt.sec,
+    pvt.nano >= 0 ? pvt.nano : 0);
+  sdWriteBytes((const uint8_t*)header, strlen(header));
+  g_metaOffset = strlen(header);   // LogMeta block starts right after the header newline
+}
+
+// --- Write service metadata block (64 bytes, VER=2+) ---
+static void writeLogMeta() {
+  // Update sample rate now that GPS is initialized
+  g_logMeta.sample_rate_hz = actualGpsFreqHz;
+  sdWriteBytes(reinterpret_cast<const uint8_t*>(&g_logMeta), sizeof(LogMeta));
+}
+
+// --- Write compact track record ---
+static void writeTrackRecord(const NavPvtPayload& pvt) {
+  TrackRecord rec;
+  rec.iTOW    = pvt.iTOW;
+  rec.nano    = pvt.nano;
+  rec.lat     = pvt.lat;
+  rec.lon     = pvt.lon;
+  rec.height  = pvt.height;
+  rec.gSpeed  = pvt.gSpeed;
+  rec.headMot = pvt.headMot;
+  rec.hAcc    = pvt.hAcc;
+  rec.sAcc    = pvt.sAcc;
+  rec.numSV   = pvt.numSV;
+  rec.fixType = pvt.fixType;
+  sdWriteBytes(reinterpret_cast<const uint8_t*>(&rec), sizeof(TrackRecord));
+  g_recordCount++;
+}
+
+// --- Update shared GPS data from PVT ---
+static void updateSharedFromPvt(const NavPvtPayload& pvt) {
+  // Strict fix check:
+  // 1. fixType >= 2 (2D/3D fix)
+  // 2. numSV >= 8 (good constellation)
+  // 3. flags & 0x01 (gnssFixOK: valid navigation solution per u-blox M10 ICD)
+  // 4. valid & 0x03 == 0x03 (validDate + validTime: confirmed UTC timestamp)
+  // 5. hAcc < 10000 (horizontal accuracy estimate < 10m)
+  bool gnssOk = (pvt.flags & 0x01) != 0;
+  bool timeValid = (pvt.valid & 0x03) == 0x03;
+  bool accOk = (pvt.hAcc < 10000);
+  bool hasFix = (pvt.fixType >= 2) && (pvt.numSV >= 8) && gnssOk && timeValid && accOk;
+
+  if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(5))) {
+    sharedGpsData.satellites = pvt.numSV;
+    sharedGpsData.speed = (pvt.gSpeed / 1000.0) * 3.6;
+    sharedGpsData.speedValid = (pvt.fixType >= 2) && gnssOk;
+    sharedGpsData.hasFix = hasFix;
+    sharedGpsData.gpsCommunicating = (pvt.fixType != 0) || (pvt.numSV > 0);
+    xSemaphoreGive(gpsMutex);
+  }
+}
+
 // --- Logging Control (called from GPS Task only) ---
 void startLogging() {
-  // Read shared GPS data safely
-  uint32_t sats = 0;
   bool hasFix = false;
   if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(10))) {
-    sats = sharedGpsData.satellites;
     hasFix = sharedGpsData.hasFix;
     xSemaphoreGive(gpsMutex);
   }
 
-  if (sats < 4 || !sdDetected || !hasFix) {
-    Serial.println("[GPS] Cannot start logging — no fix or no SD.");
+  if (!sdDetected || !hasFix) {
+    Serial.println("[GPS] Cannot start logging — no reliable fix or no SD.");
     return;
   }
 
   int n = 0;
   do {
-    sprintf(currentFileName, "/log_%03d.txt", n++);
+    sprintf(currentFileName, "/log_%03d.bin", n++);
   } while (sd.exists(currentFileName));
 
   if (logFile.open(currentFileName, O_WRONLY | O_CREAT | O_TRUNC)) {
     currentState = STATE_PREALLOCATING;
     Serial.print("[GPS] Creating file: "); Serial.println(currentFileName);
-    Serial.println("[GPS] Starting pre-allocation (200MB)...");
+    Serial.printf("[GPS] Starting pre-allocation (%llu MB)...\n", SD_PREALLOC_SIZE / (1024 * 1024));
 
-    const uint64_t PRE_ALLOC_SIZE = 200ULL * 1024 * 1024;
-    if (logFile.preAllocate(PRE_ALLOC_SIZE)) {
+    if (logFile.preAllocate(SD_PREALLOC_SIZE)) {
       isLogging = true;
+      g_recordCount = 0;
+      g_metaOffset = 0;
+      g_lastFlushedCount = 0;
+      g_lastMetaFlushMs = millis();
+      g_logMeta.record_count = 0;   // fresh file: count unknown until first meta flush
+      _logHeaderNeeded = true;
       currentState = STATE_LOGGING;
       loggingStartTime = millis();
       sdBufPos = 0;
@@ -195,23 +350,118 @@ void startLogging() {
   }
 }
 
+// --- Periodic LogMeta flush: persists record_count every 5s so a power failure
+// loses at most one flush interval of records after boot-time recovery.
+// Called from gpsTask only. Must not write over records: flush buffer first,
+// then seekSet(meta) -> write 64B -> sync -> restore data-end position.
+// NOTE: seekEnd() is NOT used here — the file is preallocated to 200MB, so
+// seekEnd() would jump past the written data to the preallocated end.
+static void flushLogMetaIfDue() {
+  if (!isLogging || g_metaOffset == 0) return;
+  if (millis() - g_lastMetaFlushMs < META_FLUSH_INTERVAL_MS) return;
+  if (g_recordCount == g_lastFlushedCount) {
+    g_lastMetaFlushMs = millis();
+    return;
+  }
+  flushSdBuffer();
+  g_logMeta.record_count = g_recordCount;
+  uint64_t dataEnd = logFile.curPosition();
+  logFile.seekSet(g_metaOffset);
+  logFile.write(&g_logMeta, sizeof(LogMeta));
+  logFile.sync();               // push sector to SD — survives power failure
+  logFile.seekSet(dataEnd);     // continue appending records
+  g_lastFlushedCount = g_recordCount;
+  g_lastMetaFlushMs = millis();
+}
+
 void stopLogging() {
   if (isLogging || currentState == STATE_PREALLOCATING) {
     if (isLogging) {
-      flushSdBuffer(); // Flush remaining buffer
-      logFile.truncate(); // Truncate to actual written size
+      flushSdBuffer();
+      // Final meta write with exact record count (before truncate)
+      if (g_metaOffset > 0) {
+        g_logMeta.record_count = g_recordCount;
+        uint64_t dataEnd = logFile.curPosition();
+        logFile.seekSet(g_metaOffset);
+        logFile.write(&g_logMeta, sizeof(LogMeta));
+        logFile.sync();
+        logFile.seekSet(dataEnd);   // truncate() cuts at the current position
+      }
+      logFile.truncate();
+    } else {
+      // Stopped during preallocation: the file holds nothing but its 200MB
+      // preallocated extent — cut it back to zero so no garbage file lingers
+      // on the SD card.
+      logFile.truncate();
     }
     logFile.close();
     isLogging = false;
+    _logHeaderNeeded = false;
     sdBufPos = 0;
+    g_recordCount = 0;
+    g_metaOffset = 0;
     currentState = STATE_READY;
     Serial.println("[GPS] Logging stopped and file closed.");
   }
 }
 
+// --- Boot/hot-plug recovery: preallocated log_*.bin files left at 200MB after a
+// power failure are truncated to hdrEnd+1+64+record_count*38 using the last
+// meta-flushed record_count. Files with count==0, without a #TRACKIFY header,
+// or with expected >= file size are left untouched. Uses local FsFile objects —
+// safe only when logging is not active (boot, or SD hot-plug re-detect).
+void recoverInterruptedLogs() {
+  FsFile dir;
+  if (!dir.open("/", O_RDONLY)) {
+    Serial.println("[RECOVERY] Cannot open SD root.");
+    return;
+  }
+  FsFile f;
+  while (f.openNext(&dir, O_RDWR)) {
+    if (!f.isDir()) {
+      char name[32];
+      f.getName(name, sizeof(name));
+      if (strncmp(name, "log_", 4) == 0 && strstr(name, ".bin") != NULL) {
+        char buf[256];
+        int n = f.read(buf, sizeof(buf));
+        int hdrEnd = -1;
+        for (int i = 0; i < n; i++) {
+          if (buf[i] == '\n') { hdrEnd = i; break; }
+        }
+        if (hdrEnd > 0 && hdrEnd < 255 && memcmp(buf, "#TRACKIFY:", 10) == 0) {
+          // LogMeta (and record_count inside it) exists only for VER>=2 files.
+          // VER=1 files have records right after the header — reading offset 60
+          // there would interpret record bytes as record_count and could corrupt
+          // a valid file.
+          buf[hdrEnd] = 0;   // null-terminate the header line for parsing
+          char* verPos = strstr(buf, "VER=");
+          int ver = (verPos != NULL) ? atoi(verPos + 4) : 0;
+          if (ver >= 2) {
+            uint32_t count = 0;
+            // record_count sits at offset 60 inside the 64-byte LogMeta (hdrEnd+1);
+            // ESP32 is little-endian, matches the stored uint32.
+            if (f.seekSet((uint32_t)hdrEnd + 1 + 60) && f.read(&count, 4) == 4) {
+              uint64_t recordStart = (uint64_t)hdrEnd + 1 + 64;
+              uint64_t expected = recordStart + (uint64_t)count * 38;
+              if (count > 0 && expected < f.fileSize()) {
+                f.truncate(expected);
+                f.sync();
+                Serial.printf("[RECOVERY] %s truncated to %llu bytes (%lu records)\n",
+                              name, expected, (unsigned long)count);
+              }
+            }
+          }
+        }
+      }
+    }
+    f.close();
+  }
+  dir.close();
+}
+
 // ========================================================
 // GPS Task — runs on Core 1, high priority
-// Handles: UART reading, TinyGPSPlus parsing, SD writing
+// Handles: UART reading, UBX frame parsing, SD writing
 // ========================================================
 void gpsTask(void *param) {
   Serial.print("[GPS] Task started on Core ");
@@ -232,7 +482,7 @@ void gpsTask(void *param) {
           if (isLogging) stopLogging();
           Serial.println("[GPS] Shutting down GPS for Wireless mode...");
           ss.end();
-          wifiManager.begin(GPS_FREQ_HZ);
+          wifiManager.begin(actualGpsFreqHz > 0 ? actualGpsFreqHz : GPS_FREQ_HZ);
           bleManager.begin();
           currentState = STATE_WIRELESS_SYNC;
           break;
@@ -246,53 +496,51 @@ void gpsTask(void *param) {
       }
     }
 
-    // --- 2. Read GPS UART and write to SD ---
+    // --- 2. Read GPS UART — parse UBX frames, write compact records to SD ---
     if (currentState != STATE_WIRELESS_SYNC) {
-      // Periodic SD check if not detected
       static uint32_t lastSdCheck = 0;
       if (!sdDetected && (millis() - lastSdCheck) > 10000) {
         lastSdCheck = millis();
         if (sd.begin(SdSpiConfig(SD_CS, SHARED_SPI, SD_SCK_MHZ(20), &SPI))) {
           sdDetected = true;
           Serial.println("[SD] Card detected (Hot-plug).");
+          recoverInterruptedLogs();   // not logging here — SD was absent
         }
       }
 
       int available = ss.available();
       while (available-- > 0) {
         char c = ss.read();
-        gps.encode(c);
 
-        if (isLogging) {
-          sdWriteBuffer[sdBufPos++] = (uint8_t)c;
-          if (sdBufPos >= SD_WRITE_BUFFER_SIZE) {
-            logFile.write(sdWriteBuffer, SD_WRITE_BUFFER_SIZE);
-            sdBufPos = 0;
-            lastFlushTime = millis();
+        if (_ubxParser.feed((uint8_t)c)) {
+          const NavPvtPayload& pvt = _ubxParser.pvt();
+
+          updateSharedFromPvt(pvt);
+
+          if (isLogging) {
+            if (_logHeaderNeeded) {
+              writeLogHeader(pvt);
+              writeLogMeta();
+              _logHeaderNeeded = false;
+            }
+            writeTrackRecord(pvt);
           }
         }
       }
 
-      // Periodic flush of partial buffer
       if (isLogging && sdBufPos > 0 && (millis() - lastFlushTime) >= SD_FLUSH_INTERVAL_MS) {
         flushSdBuffer();
         lastFlushTime = millis();
       }
+      flushLogMetaIfDue();   // periodic record_count persistence (crash survival)
 
-      // --- 3. Update shared GPS data under mutex ---
-      bool hasFix = gps.location.isValid() && gps.location.age() < 2000 && gps.satellites.value() >= 8;
-      bool communicating = gps.charsProcessed() > 10;
-
+      // --- 3. Update device state based on fix and SD detection ---
+      bool hasFix = false;
       if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(5))) {
-        sharedGpsData.satellites = gps.satellites.value();
-        sharedGpsData.speed = gps.speed.kmph();
-        sharedGpsData.speedValid = gps.speed.isValid();
-        sharedGpsData.hasFix = hasFix;
-        sharedGpsData.gpsCommunicating = communicating;
+        hasFix = sharedGpsData.hasFix;
         xSemaphoreGive(gpsMutex);
       }
 
-      // Update device state based on fix and SD detection
       if (hasFix && sdDetected && currentState == STATE_IDLE) {
         currentState = STATE_READY;
       } else if ((!hasFix || !sdDetected) && currentState == STATE_READY) {
@@ -564,6 +812,11 @@ void setup() {
 
   // SD init
   setupSD();
+
+  // Recover log_*.bin files left at preallocated size by a power failure
+  if (sdDetected) {
+    recoverInterruptedLogs();
+  }
   
   // NeoPixel init
   strip.begin();
@@ -574,6 +827,9 @@ void setup() {
   button.attachClick(handleButton);
   button.attachLongPressStop(handleLongPress);
   button.setLongPressIntervalMs(4000);
+
+  // Prepare log metadata (MAC, serial, version — ready before any logging starts)
+  prepareLogMeta();
 
   // Create FreeRTOS synchronization primitives
   gpsMutex = xSemaphoreCreateMutex();

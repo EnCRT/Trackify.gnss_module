@@ -21,7 +21,7 @@ One long button press turns the tracker into an access point: WiFi captive porta
 | 🧩 Component | Model |
 |---|---|
 | 🧠 MCU | Heltec ESP32 WiFi Kit 32 (V3) — ESP32-S3, 16MB Flash |
-| 🛰️ GNSS | HGLRC M100-5883 M10 GPS Module + Compass (Quectel N16R8) |
+| 🛰️ GNSS | HGLRC M100-5883 M10 GPS Module + Compass (u-blox M10) |
 | 💾 Storage | Micro SD Card Module SPI 3.3V TF Reader + MicroSD 32GB V30 |
 | 📟 Display | SSD1306 128×64 OLED I²C |
 | 💡 LED | WS2812B SMD RGB 3×10mm |
@@ -41,7 +41,7 @@ One long button press turns the tracker into an access point: WiFi captive porta
 │  ┌─────────────────────┐       ┌────────────────────┐    │
 │  │ 🖥️  UI Task  (P=2) │◄─────►│  ⚡ GPS Task (P=5)  │   │
 │  │ • 🖼️  OLED render  │ Queue │ • 📡 UART read      │   │
-│  │ • 🔘 Button tick   │       │ • 📊 NMEA parse     │   │
+│  │ • 🔘 Button tick   │       │ • 📊 UBX PVT parse  │   │
 │  │ • 🌐 WiFi DNS      │       │ • 💾 SD buffering   │   │
 │  │ • 📶 BLE handling  │       │ • 🎯 Fix detection  │   │
 │  └─────────┬───────────┘       └─────────┬──────────┘    │
@@ -53,14 +53,14 @@ One long button press turns the tracker into an access point: WiFi captive porta
 └──────────────────────────────────────────────────────────┘
 ```
 
-> **Why?** 25 Hz GPS parsing generates ~1 KB/s of raw NMEA data. Core 1 at priority 5 handles it without drops — zero byte loss. Core 0 handles UI and wireless comms without interfering with logging.
+> **Why?** 25 Hz binary GPS parsing (UBX-NAV-PVT) requires sustained processing without UART buffer overflow. Core 1 at priority 5 handles it without drops — zero byte loss. Core 0 handles UI and wireless comms without interfering with logging.
 
 
 | 🏷️ State | 💡 LED Pattern | 🎨 Color | What's happening |
 |---|---|---|---|
 | `IDLE` | Double flash | 🟠 Orange | Waiting for satellites / SD card |
 | `READY` | Double flash | ⚪ White | Ready to log, waiting for button |
-| `PREALLOCATING` | Double flash | 🔴 Red | Allocating 200 MB on SD |
+| `PREALLOCATING` | Double flash | 🔴 Red | Allocating contiguous file on SD |
 | `LOGGING` | Solid | 🔴 Red | Logging in progress! |
 | `WIRELESS_SYNC` | Double flash | 🩵 Cyan | WiFi AP + BLE active |
 | Button held | Solid | 🔴 Red | Button pressed |
@@ -71,8 +71,8 @@ One long button press turns the tracker into an access point: WiFi captive porta
 
 | 🔌 Signal | 📍 Pin | Purpose |
 |---|---|---|
-| `GPS_RX` | 4 | UART RX ← Quectel N16R8 TX |
-| `GPS_TX` | 5 | UART TX → Quectel N16R8 RX |
+| `GPS_RX` | 4 | UART RX ← GNSS module TX |
+| `GPS_TX` | 5 | UART TX → GNSS module RX |
 | `SD_MOSI` | 40 | SPI MOSI |
 | `SD_MISO` | 41 | SPI MISO |
 | `SD_SCK` | 42 | SPI SCK (20 MHz) |
@@ -96,7 +96,7 @@ One long button press turns the tracker into an access point: WiFi captive porta
 At 150 km/h a motorcycle travels **1.7 meters every 40 ms**. Only 25 Hz reveals the real line through a corner: where braking starts, the apex, where throttle opens. At 1 Hz all you see is a blurry trace with 42-meter gaps.
 
 ```cpp
-// src/main.cpp:38 — toggle mode
+// src/main.cpp:40 — toggle mode
 #define GPS_FREQ_HZ 25  // 10 or 25 Hz
 ```
 
@@ -104,13 +104,15 @@ At 150 km/h a motorcycle travels **1.7 meters every 40 ms**. Only 25 Hz reveals 
 
 ## 🛰️ GPS & SD Logging
 
-- **25 Hz** — UBX command configures the Quectel N16R8 module at boot
-- **UART buffer 2048 bytes** — overflow protection at peak data rates
+- **25 Hz** — UBX configuration via SparkFun u-blox GNSS v3 library / fallback UBX-CFG-RATE at boot
+- **Compact binary format (`.bin`)** — UBX-NAV-PVT records (38 bytes per point) with 64-byte LogMeta header
+- **UART buffer 8192 bytes** — overflow protection during SD write/allocation spikes
 - **Sector-aligned buffer 512 bytes** — optimized for SD card physical sectors
 - **Flush every 200 ms** — balances data safety with SPI bus load
-- **200 MB preallocation** — eliminates FAT fragmentation, critical for 25 Hz sustained writes
+- **50 MB preallocation** — eliminates FAT fragmentation (~15 hours of 25Hz logging), minimal allocation latency
+- **Periodic meta flush (5s) & auto-recovery** — file record count persisted every 5s; crash recovery truncates interrupted preallocated files on boot
 - **Truncate on stop** — file trimmed to actual written size
-- **Auto-increment filenames** — `log_000.txt` → `log_001.txt` → ...
+- **Auto-increment filenames** — `log_000.bin` → `log_001.bin` → ...
 - **Hot-plug SD** — re-checked every 10 sec, card can be inserted anytime
 
 ---
@@ -129,10 +131,10 @@ DNS:     :53 → captive portal
 | 🌍 Endpoint | Method | Description |
 |---|---|---|
 | `/` | GET | SPA with log table, dark/light theme, animated background |
-| `/download?file=` | GET | Download raw TXT file |
+| `/download?file=` | GET | Download raw `.bin` or legacy `.txt` file |
 | `/delete?file=` | POST | Delete a file |
 
-> 💡 The web UI does **on-the-fly NMEA → GPX conversion in the browser** — no extra software needed, just open the page on your phone and download GPX.
+> 💡 The web UI performs **on-the-fly BIN/NMEA → GPX conversion in the browser** — no extra software needed, just open the page on your phone and download GPX.
 
 ### 📶 Bluetooth Low Energy (NimBLE)
 
@@ -143,19 +145,22 @@ DNS:     :53 → captive portal
 
 | 📨 Characteristic | UUID | Props |
 |---|---|---|
-| Command | `beb5483e-...` | WRITE |
-| Data | `2c27702b-...` | NOTIFY |
+| Command | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | WRITE, WRITE_NR |
+| Data | `2c27702b-a010-4ea5-a228-4efb7965aa1b` | NOTIFY |
 
-**Commands:** `LIST` — file listing from SD (in ~200-byte chunks), `WIFI` — SSID and password for direct connection.
+**Commands:** 
+- `LIST` — file listing from SD (`<filename>;<size>\n` ... `END_LIST\n`)
+- `GET <file>` — start streaming file chunks (`FILE:<filename>:<size>\n` ... `END_FILE\n`)
+- `WIFI` — SSID and password for direct connection (`WIFI:Trackify:12345678\n`)
 
 ---
 
 ## 📚 Tech Stack
 
-| 🧱 Layer | 📦 Library | Purpose |
+| 🧱 Layer | 📦 Library / Module | Purpose |
 |---|---|---|
 | RTOS | FreeRTOS | Dual-core scheduling, mutex, queue |
-| GNSS | TinyGPSPlus | Parsing $GPRMC, $GPGGA |
+| GNSS | UbxParser + SparkFun GNSS v3 | UBX-NAV-PVT binary parsing & config |
 | Display | U8g2 | OLED SSD1306 128×64 I²C |
 | SD | SdFat v2 | SPI 20MHz, preAllocate(), truncate() |
 | WiFi | ESPAsyncWebServer + DNSServer | Captive portal, streaming download |
@@ -182,12 +187,13 @@ pio device monitor -b 115200    # serial monitor
 
 ## 📱 Integration with moto_lap_timer
 
-> 📖 Full workflow: [bluetooth_integration_docs.md](bluetooth_integration_docs.md)
+> 📖 Full workflow: [bluetooth_integration_docs.md](bluetooth_integration_docs.md)  
+> 📖 Binary specification: [trackify_bin_format_spec.md](trackify_bin_format_spec.md)
 
 ```
 🏍️ Finished a session → 🔘 Held button 4s → 📶 BLE/WiFi active
 → 📱 Opened Moto Lap Timer → 🔵 Bluetooth → Found Trackify
-→ 📋 LIST → 📥 Downloaded track → 🗺️ Auto-parsing & analysis screen
+→ 📋 LIST → 📥 Downloaded .bin track → 🗺️ Auto-parsing & analysis screen
 ```
 
 ---
@@ -199,11 +205,15 @@ Trackify.gnss_module/
 ├── platformio.ini                  # 🧪 PlatformIO configuration
 ├── src/
 │   ├── main.cpp                    # 🚀 Entry point, FreeRTOS, GPS/SD/OLED/LED
+│   ├── ubx_parser.h                # 🛰️ UBX parser, NavPvtPayload, TrackRecord, LogMeta
 │   ├── ble_manager.cpp / .h        # 📶 BLE GATT server (NimBLE)
 │   └── wifi_manager.cpp            # 🌐 WiFi AP + AsyncWebServer + DNS
 ├── include/
 │   ├── wifi_manager.h              # 🌐 WiFiManager header
 │   └── logs_ui.h                   # 🎨 Embedded HTML/CSS/JS SPA
 ├── bluetooth_integration_docs.md   # 📖 BLE integration with moto_lap_timer
-└── test/                           # 🧪 Unit tests
+├── trackify_bin_format_spec.md     # 📖 Trackify .bin specification (VER 1 & 2)
+└── test/                           # 🧪 Unit tests and fixture generator
+    ├── generate_fixtures.py        # ⚙️ Synthetic .bin track generator
+    └── fixtures/                   # 📁 Reference test fixtures (v1_sample.bin, v2_sample.bin)
 ```

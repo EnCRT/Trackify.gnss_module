@@ -334,40 +334,105 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
             try {
                 const response = await fetch(`/download?file=${encodeURIComponent(fileName)}`);
                 if (!response.ok) throw new Error('Network response was not ok');
+                const buffer = await response.arrayBuffer();
+                const view = new DataView(buffer);
                 
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let { value, done } = await reader.read();
-                let text = decoder.decode(value);
-                
-                // If the file is large, we might need to read it in chunks, 
-                // but for now, let's assume it fits in memory or read all
-                while (!done) {
-                    ({ value, done } = await reader.read());
-                    if (value) text += decoder.decode(value);
+                let isBin = false;
+                if (buffer.byteLength >= 23) {
+                    const header = new TextDecoder().decode(new Uint8Array(buffer, 0, Math.min(64, buffer.byteLength)));
+                    isBin = header.startsWith('#TRACKIFY:VER=');
                 }
-
-                const gpxContent = convertNmeaToGpx(text, fileName);
+                
+                let gpxContent;
+                if (isBin) {
+                    gpxContent = convertBinToGpx(view, fileName);
+                } else {
+                    gpxContent = convertNmeaToGpx(new TextDecoder().decode(buffer), fileName);
+                }
+                
                 const blob = new Blob([gpxContent], { type: 'application/gpx+xml' });
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.style.display = 'none';
                 a.href = url;
-                a.download = fileName.replace('.txt', '.gpx');
+                a.download = fileName.replace('.bin', '.gpx').replace('.txt', '.gpx');
                 document.body.appendChild(a);
                 a.click();
                 window.URL.revokeObjectURL(url);
             } catch (err) {
                 console.error('GPX Conversion Error:', err);
-                alert('Ошибка при конвертации в GPX');
+                alert('GPX conversion error');
             } finally {
                 btn.classList.remove('loading');
             }
         }
 
+        function convertBinToGpx(view, fileName) {
+            const RECORD_SIZE = 38;
+            let offset = 0;
+            
+            let headerStr = '';
+            while (offset < view.byteLength) {
+                const b = view.getUint8(offset++);
+                if (b === 0x0A) break;
+                headerStr += String.fromCharCode(b);
+            }
+            const verMatch = headerStr.match(/VER=(\d+)/);
+            const ver = verMatch ? parseInt(verMatch[1], 10) : 1;
+            const dataStart = ver >= 2 ? offset + 64 : offset;
+            const recordCount = Math.floor((view.byteLength - dataStart) / RECORD_SIZE);
+            
+            if (dataStart >= view.byteLength || recordCount === 0) return '';
+            
+            let gpx = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+            gpx += `<gpx version="1.1" creator="Trackify" xmlns="http://www.topografix.com/GPX/1/1">\n`;
+            gpx += `  <trk>\n    <name>${fileName}</name>\n    <trkseg>\n`;
+
+            for (let i = 0; i < recordCount; i++) {
+                const off = dataStart + i * RECORD_SIZE;
+                
+                const iTOW   = view.getUint32(off + 0, true);
+                const nano   = view.getInt32(off + 4, true);
+                const lat     = view.getInt32(off + 8, true) / 1e7;
+                const lon     = view.getInt32(off + 12, true) / 1e7;
+                const height  = view.getInt32(off + 16, true) / 1000.0;
+                const gSpeed  = view.getInt32(off + 20, true) / 1000.0;
+                const headMot = view.getInt32(off + 24, true) / 1e5;
+                const hAcc    = view.getUint32(off + 28, true) / 1000.0;
+                const sAcc    = view.getUint32(off + 32, true) / 1000.0;
+                const numSV   = view.getUint8(off + 36);
+                const fixType = view.getUint8(off + 37);
+                
+                const towSec = iTOW / 1000;
+                const secOfWeek = Math.floor(towSec);
+                const ms = iTOW % 1000;
+                const ns = nano;
+                const fracSec = (ms / 1000 + ns / 1e9).toFixed(3).substring(1);
+                
+                const gpsEpoch = new Date(Date.UTC(1980, 0, 6, 0, 0, 0));
+                const pts = gpsEpoch.getTime() / 1000 + secOfWeek;
+                const dt = new Date(pts * 1000);
+                const iso = dt.toISOString().replace('Z', '') + fracSec + 'Z';
+                
+                gpx += `      <trkpt lat="${lat.toFixed(7)}" lon="${lon.toFixed(7)}">\n`;
+                gpx += `        <ele>${height.toFixed(1)}</ele>\n`;
+                gpx += `        <time>${iso}</time>\n`;
+                gpx += `        <extensions>\n`;
+                gpx += `          <speed>${gSpeed.toFixed(2)}</speed>\n`;
+                if (headMot >= 0) gpx += `          <course>${headMot.toFixed(1)}</course>\n`;
+                gpx += `          <hAcc>${hAcc.toFixed(1)}</hAcc>\n`;
+                gpx += `          <sAcc>${sAcc.toFixed(1)}</sAcc>\n`;
+                gpx += `          <satellites>${numSV}</satellites>\n`;
+                gpx += `          <fixType>${fixType}</fixType>\n`;
+                gpx += `        </extensions>\n`;
+                gpx += `      </trkpt>\n`;
+            }
+
+            gpx += `    </trkseg>\n  </trk>\n</gpx>`;
+            return gpx;
+        }
+
         function convertNmeaToGpx(nmeaText, fileName) {
-            // Some logs might not have \n, they might just have $ to start a new sentence.
-            // Let's ensure we split correctly.
             const rawSentences = nmeaText.split('$');
             let gpx = `<?xml version="1.0" encoding="UTF-8"?>\n`;
             gpx += `<gpx version="1.1" creator="Trackify" xmlns="http://www.topografix.com/GPX/1/1">\n`;
@@ -375,19 +440,19 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
 
             let currentPoint = null;
             let lastValidDate = null;
+            let prevPoint = null;
 
             for (let raw of rawSentences) {
                 if (raw.trim().length === 0) continue;
                 
-                // Remove trailing checksums/newlines for cleaner parsing
                 const cleanLine = raw.split('*')[0].trim();
                 const parts = cleanLine.split(',');
                 if (parts.length < 1) continue;
                 
-                const type = parts[0].substring(2); // GPRMC -> RMC (or GNRMC -> RMC)
+                const type = parts[0].substring(2);
 
                 if (type === 'RMC') {
-                    if (parts[2] !== 'A' && parts[2] !== 'V') continue; // V is warning, but sometimes has valid coords
+                    if (parts[2] !== 'A' && parts[2] !== 'V') continue;
                     
                     const time = parts[1]; 
                     const latRaw = parts[3];
@@ -405,37 +470,49 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
                             let timestamp = null;
                             if (date && time) {
                                 timestamp = parseNmeaDateTime(date, time);
-                                lastValidDate = date; // Cache date
+                                lastValidDate = date;
                             } else if (time && lastValidDate) {
                                 timestamp = parseNmeaDateTime(lastValidDate, time);
                             }
 
                             const speedKmph = speedKnots ? (parseFloat(speedKnots) * 1.852) : null;
                             const speedFinal = isNaN(speedKmph) ? null : speedKmph;
-                            const courseFinal = courseDeg ? parseFloat(courseDeg) : null;
-                            const courseValid = isNaN(courseFinal) ? null : courseFinal;
-                            
-                            if (currentPoint && currentPoint.lat !== lat && currentPoint.lon !== lon) {
-                                gpx += formatPoint(currentPoint);
-                            } else if (currentPoint && currentPoint.time !== timestamp) {
-                                // Same coords but different time (e.g. stopped)
-                                gpx += formatPoint(currentPoint);
+                            let courseFinal = courseDeg ? parseFloat(courseDeg) : null;
+                            if (isNaN(courseFinal)) courseFinal = null;
+
+                            if (currentPoint && currentPoint.lat !== null) {
+                                const dist = haversineDistance(currentPoint.lat, currentPoint.lon, lat, lon);
+                                if (dist >= 0.5 || (currentPoint.time !== null && timestamp !== null && currentPoint.time !== timestamp)) {
+                                    if (currentPoint.course === null && prevPoint && prevPoint.lat !== null) {
+                                        currentPoint.course = courseFromDeltas(prevPoint.lat, prevPoint.lon, currentPoint.lat, currentPoint.lon);
+                                    }
+                                    gpx += formatPoint(currentPoint);
+                                    prevPoint = currentPoint;
+                                }
                             }
                             
-                            currentPoint = { lat, lon, time: timestamp, ele: null, speed: speedFinal, course: courseValid };
-                        } catch(e) { /* ignore parse errors for single lines */ }
+                            currentPoint = { lat, lon, time: timestamp, ele: null, speed: speedFinal, course: courseFinal };
+                        } catch(e) { /* ignore parse errors */ }
                     }
                 } else if (type === 'GGA' && currentPoint) {
                     const time = parts[1];
-                    // Sync by integer seconds
-                    if (currentPoint.time && time && currentPoint.time.includes(`T${time.substring(0, 2)}:${time.substring(2, 4)}:${time.substring(4, 6)}`)) {
-                        const alt = parts[9];
-                        if (alt) currentPoint.ele = parseFloat(alt).toFixed(1);
+                    if (currentPoint.time && time) {
+                        const t = currentPoint.time;
+                        const hh = time.substring(0, 2);
+                        const mm = time.substring(2, 4);
+                        const ss = time.substring(4, 6);
+                        if (t.includes(`T${hh}:${mm}:${ss}`)) {
+                            const alt = parts[9];
+                            if (alt) currentPoint.ele = parseFloat(alt).toFixed(1);
+                        }
                     }
                 }
             }
             
             if (currentPoint) {
+                if (currentPoint.course === null && prevPoint && prevPoint.lat !== null) {
+                    currentPoint.course = courseFromDeltas(prevPoint.lat, prevPoint.lon, currentPoint.lat, currentPoint.lon);
+                }
                 gpx += formatPoint(currentPoint);
             }
 
@@ -465,11 +542,31 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
             return dec;
         }
 
+        function haversineDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) ** 2 +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                      Math.sin(dLon / 2) ** 2;
+            return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        function courseFromDeltas(lat1, lon1, lat2, lon2) {
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const lat1r = lat1 * Math.PI / 180;
+            const lat2r = lat2 * Math.PI / 180;
+            const y = Math.sin(dLon) * Math.cos(lat2r);
+            const x = Math.cos(lat1r) * Math.sin(lat2r) -
+                      Math.sin(lat1r) * Math.cos(lat2r) * Math.cos(dLon);
+            let deg = Math.atan2(y, x) * 180 / Math.PI;
+            return (deg + 360) % 360;
+        }
+
         function parseNmeaDateTime(date, time) {
             if (!date || !time) return null;
-            // date: DDMMYY, time: HHMMSS.SS...
             const dMatch = date.match(/^(\d{2})(\d{2})(\d{2})/);
-            const tMatch = time.match(/^(\d{2})(\d{2})(\d{2})/);
+            const tMatch = time.match(/^(\d{2})(\d{2})(\d{2})(?:\.(\d+))?/);
             if (!dMatch || !tMatch) return null;
             
             const day = dMatch[1];
@@ -478,8 +575,9 @@ const char LOGS_HTML[] PROGMEM = R"rawliteral(
             const hour = tMatch[1];
             const min = tMatch[2];
             const sec = tMatch[3];
+            const frac = tMatch[4] || '00';
             
-            return `${year}-${month}-${day}T${hour}:${min}:${sec}Z`;
+            return `${year}-${month}-${day}T${hour}:${min}:${sec}.${frac.padEnd(2,'0')}Z`;
         }
 
         function deleteFile(fileName) {
