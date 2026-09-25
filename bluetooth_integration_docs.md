@@ -1,4 +1,4 @@
-# Документация: Bluetooth (BLE) интеграция Trackify и Moto Lap Timer
+﻿# Документация: Bluetooth (BLE) интеграция Trackify и Moto Lap Timer
 
 Данная документация описывает функционал передачи трек-файлов между аппаратным GPS логером (ESP32) и мобильным приложением (Flutter) посредством Bluetooth Low Energy (BLE).
 
@@ -59,7 +59,7 @@ WIFI:Trackify:12345678\n
 
 ---
 
-## 2. Функционал Мобильного Приложения (Flutter - moto_lap_timer)
+## 2. Функционал Мобильного Приложения (Flutter - Trackify.MobileApp)
 
 ### Интерфейс пользователя (UI)
 1. **Кнопка BT (Bluetooth):**

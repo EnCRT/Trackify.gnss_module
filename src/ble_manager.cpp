@@ -1,9 +1,11 @@
 #include "ble_manager.h"
 #include <NimBLEDevice.h>
 #include "SdFat.h"
+#include "ubx_parser.h"
 
 // Defined in main.cpp
 extern SdFs sd;
+extern LogMeta g_logMeta;
 
 #define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define COMMAND_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -42,6 +44,8 @@ class CommandCallbacks: public NimBLECharacteristicCallbacks {
                 bleManager.triggerListFiles();
             } else if (cmd == "WIFI") {
                 bleManager.sendWifiInfo();
+            } else if (cmd == "DEVICE") {
+                bleManager.sendDeviceInfo();
             } else if (cmd.startsWith("GET ")) {
                 String filename = cmd.substring(4);
                 filename.trim();
@@ -144,6 +148,24 @@ void BLEManager::sendWifiInfo() {
     pDataCharacteristic->setValue((uint8_t*)wifiData.c_str(), wifiData.length());
     pDataCharacteristic->notify();
     Serial.println("[BLE] Sent WiFi credentials.");
+}
+
+void BLEManager::sendDeviceInfo() {
+    // Format: DEVICE:name:model:firmware_version:serial:sample_rate_hz\n
+    // firmware_version formatted as hex major.minor (e.g. 0x0200 -> 2.0)
+    uint8_t major = (g_logMeta.firmware_version >> 8) & 0xFF;
+    uint8_t minor = g_logMeta.firmware_version & 0xFF;
+    char fwBuf[16];
+    snprintf(fwBuf, sizeof(fwBuf), "v%d.%d", major, minor);
+
+    String devData = "DEVICE:" + String(g_logMeta.name) + ":" + 
+                     String(g_logMeta.model) + ":" + 
+                     String(fwBuf) + ":" + 
+                     String(g_logMeta.serial_number) + ":" + 
+                     String(g_logMeta.sample_rate_hz) + "\n";
+    pDataCharacteristic->setValue((uint8_t*)devData.c_str(), devData.length());
+    pDataCharacteristic->notify();
+    Serial.printf("[BLE] Sent device info: %s", devData.c_str());
 }
 
 void BLEManager::sendChunk(const uint8_t* data, size_t len) {

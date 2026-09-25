@@ -73,7 +73,7 @@ static bool _logHeaderNeeded = false;
 static uint16_t actualGpsFreqHz = 0;
 
 // --- Log Metadata (prepared at startup, written to each .bin file) ---
-static LogMeta g_logMeta;
+LogMeta g_logMeta;
 static void prepareLogMeta() {
   memset(&g_logMeta, 0, sizeof(g_logMeta));
 

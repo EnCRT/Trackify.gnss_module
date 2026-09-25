@@ -99,7 +99,7 @@ sequenceDiagram
     participant App as 📱 Mobile App (Flutter)
     participant Tracker as 🏍️ Trackify (ESP32)
 
-    Note over App,Tracker: 1. Подключение и получение списка
+    Note over App,Tracker: 1. Подключение, получение списка и метаданных
     App->>Tracker: Connect & Request MTU (517)
     App->>Tracker: Enable Notifications on Data Characteristic
     App->>Tracker: Write Command: "LIST"
@@ -108,20 +108,24 @@ sequenceDiagram
     end
     Tracker-->>App: Notify: "END_LIST\n"
 
-    Note over App,Tracker: 2. Скачивание выбранного лога
-    App->>Tracker: Write Command: "GET log_001.bin"
-    Tracker-->>App: Notify: "FILE:log_001.bin:285400\n" (Инициализация Progress Bar)
-    loop Пакетная передача (Burst до 5 чанков)
-        Tracker-->>App: Notify: [Raw Binary Chunks up to (MTU-3) bytes]
-        Note over App: Накопление байтов в буфер, обновление %
-    end
-    Tracker-->>App: Notify: "END_FILE\n"
-    Note over App: Парсинг .bin -> Отображение трека на карте
+    App->>Tracker: Write Command: "DEVICE"
+    Tracker-->>App: Notify: "DEVICE:Trackify MX:Trackify GNSS:v2.0:A1B2C3:25\n"
+    Note over App: Отрисовка карточки логера (имя, версия v2.0, частота 25 Hz)
 
     opt Запрос реквизитов Wi-Fi
         App->>Tracker: Write Command: "WIFI"
         Tracker-->>App: Notify: "WIFI:Trackify:12345678\n"
     end
+
+    Note over App,Tracker: 2. Скачивание выбранного лога (BLE Fast Transfer)
+    App->>Tracker: Write Command: "GET log_001.bin"
+    Tracker-->>App: Notify: "FILE:log_001.bin:285400\n" (Инициализация Progress Bar)
+    loop Пакетная передача (Burst до 5 чанков)
+        Tracker-->>App: Notify: [Raw Binary Chunks up to (MTU-3) bytes]
+        Note over App: Накопление байтов в буфер, обновление % (Foreground Service)
+    end
+    Tracker-->>App: Notify: "END_FILE\n"
+    Note over App: Парсинг .bin -> Отображение трека на карте (RaceCreationScreen)
 ```
 
 #### Обработка ошибок по BLE
@@ -183,3 +187,18 @@ sequenceDiagram
    - При старте устройства функция `recoverInterruptedLogs()` находит все файлы с незавершённым размером и безопасно обрезает (`truncate`) их ровно по количеству записанных записей. Максимальная потеря при аварийном обесточивании — последние 5 секунд заезда.
 2. **Буфер кольцевой очереди UART:**
    - Буфер увеличен до 8192 байт. При временной занятости шины SPI SD-картой поток 25 Гц гарантированно не теряет пакеты.
+
+---
+
+## 🧪 7. Тестирование мобильного приложения без физического трекера (Эмулятор / E2E)
+
+Для разработки и тестирования мобильного клиента (экраны `RaceCreationScreen`, `GatePlacementMap`, `LapCalculatorService`, очередь синхронизации) не обязательно иметь физический ESP32 трекер:
+
+1. **Генератор синтетического заезда:**
+   В репозитории доступен скрипт [`generate_ternovka_bin.py`](generate_ternovka_bin.py), формирующий валидный файл формата `VER=2` с частотой 25 Гц, динамической скоростью (55–135 км/ч) и реалистичной физикой ускорений/торможений.
+2. **Готовый тестовый лог:**
+   [`log_ternovka_4laps.bin`](log_ternovka_4laps.bin) — сессия из 4 кругов по 2.3–2.5 минут (~4.6 км кольцевая трасса в г. Терновка).
+3. **Использование в Android эмуляторе:**
+   - Файл `log_ternovka_4laps.bin` перетаскивается в окно эмулятора (в папку `/sdcard/Download/`).
+   - В приложении нажимается кнопка **➕** (*Добавить заезд*), выбирается файл из памяти устройства, после чего тестируются расстановка створов, расчет кругов и синхронизация с API.
+

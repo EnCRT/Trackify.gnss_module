@@ -1,4 +1,4 @@
-# 🏍️ Trackify GNSS Module v.0.1.2
+﻿# 🏍️ Trackify GNSS Module v.0.1.2
 
 <p align="center">
   <img src="https://img.shields.io/badge/board-ESP32--S3-00979D?style=for-the-badge&logo=espressif" alt="ESP32-S3">
@@ -185,7 +185,7 @@ pio device monitor -b 115200    # serial monitor
 
 ---
 
-## 📱 Integration with moto_lap_timer
+## 📱 Integration with Trackify.MobileApp
 
 > 🗺️ **Full Architecture & Integration Map:** [SYSTEM_GUIDELINE.md](SYSTEM_GUIDELINE.md)  
 > 📖 BLE protocol workflow: [bluetooth_integration_docs.md](bluetooth_integration_docs.md)  
@@ -212,7 +212,7 @@ Trackify.gnss_module/
 ├── include/
 │   ├── wifi_manager.h              # 🌐 WiFiManager header
 │   └── logs_ui.h                   # 🎨 Embedded HTML/CSS/JS SPA
-├── bluetooth_integration_docs.md   # 📖 BLE integration with moto_lap_timer
+├── bluetooth_integration_docs.md   # 📖 BLE integration with Trackify.MobileApp
 ├── trackify_bin_format_spec.md     # 📖 Trackify .bin specification (VER 1 & 2)
 └── test/                           # 🧪 Unit tests and fixture generator
     ├── generate_fixtures.py        # ⚙️ Synthetic .bin track generator

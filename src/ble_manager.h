@@ -16,6 +16,7 @@ public:
     void triggerListFiles();
     void triggerFileTransfer(const String& filename);
     void sendWifiInfo();
+    void sendDeviceInfo();
 
 private:
     bool _isRunning = false;
